@@ -24,13 +24,11 @@ contract Slasher is ISlasher {
         uint256 challengeWindowSeconds;
         uint256 commitmentType;
         // Beacon chain related
-        address beaconBlockRootsContract;
         uint256 eth2GenesisTimestamp;
         uint256 slotSeconds;
-        uint256 justificationDelay;
+        uint256 finalizationSlots;
         uint256 blockhashLookback;
         uint256 slotTime;
-        uint256 eip4788Lookback;
     }
 
     struct BlockHeaderData {
@@ -63,12 +61,12 @@ contract Slasher is ISlasher {
         // block number where the transaction is included
         uint256 inclusionBlockNumber;
         // RLP-encoded block header of the previous block of the inclusion block
-        // (for clarity: `previousBlockHeader.number == inclusionBlockNumber - 1`)
-        bytes previousBlockHeaderRLP;
+        // (for clarity: `parentBlockHeaderRLP.number == inclusionBlockNumber - 1`)
+        bytes parentBlockHeaderRLP;
         // RLP-encoded block header where the committed transaction is included
         bytes inclusionBlockHeaderRLP;
         // merkle inclusion proof of the account in the state trie of the previous block
-        // (checked against the previousBlockHeader.stateRoot)
+        // (checked against the parentBlockHeaderRLP.stateRoot)
         bytes accountMerkleProof;
         // merkle inclusion proof of the transaction in the transaction trie of the inclusion block
         // (checked against the inclusionBlockHeader.txRoot).
@@ -89,21 +87,23 @@ contract Slasher is ISlasher {
      */
     error IncorrectChallengeBond();
     error InvalidCommitmentType();
+    error BlockIsNotFinalized();
     error OnlyApprovedRelays();
     error BeaconRootNotFound();
     error ChallengeAlreadyExists();
     error ChallengeDoesNotExist();
     error DelegationExpired();
     error EthTransferFailed();
-    error ProofIsTooOld();
+    error BlockIsTooOld();
+    error InvalidParentBlockHash();
     error InvalidBlockHash();
     error UnexpectedSigner();
-    error InvalidParentBlockHash();
     error TransactionExcluded();
     error WrongTransactionHashProof();
     error AccountDoesNotExist();
     error AccountNonceTooHigh();
     error AccountBalanceTooLow();
+    error WrongSlotNumberProof();
 
     /**
      *
@@ -153,12 +153,23 @@ contract Slasher is ISlasher {
             revert IncorrectChallengeBond();
         }
 
+        // Check that the commitment type is valid
         if (commitment.commitmentType != _config.commitmentType) {
             revert InvalidCommitmentType();
         }
 
+        // Prevent challenges for slots that are not finalized by Ethereum consensus yet.
+        if (delegation.slot > _getCurrentSlot() - _config.finalizationSlots) {
+            revert BlockIsNotFinalized();
+        }
+
         // Decode the opaque commitment payload
         InclusionPayload memory payload = abi.decode(commitment.payload, (InclusionPayload));
+
+        // Check if the delegation applies to the slot of the commitment
+        if (delegation.slot != payload.slot) {
+            revert DelegationExpired();
+        }
 
         // Compute the challenge ID
         challengeID = _computeChallengeID(commitment, delegation);
@@ -166,11 +177,6 @@ contract Slasher is ISlasher {
         // Check if the challenge already exists
         if (_challenges[challengeID].challenger != address(0)) {
             revert ChallengeAlreadyExists();
-        }
-
-        // Check if the delegation applies to the slot of the commitment
-        if (delegation.slot != payload.slot) {
-            revert DelegationExpired();
         }
 
         // Save the challenge
@@ -190,12 +196,12 @@ contract Slasher is ISlasher {
         bytes32 challengeID = _computeChallengeID(signedCommitment.commitment, delegation);
         Challenge memory challenge = _challenges[challengeID];
 
-        // Check if the challenge exists
+        // Verify the challenge exists
         if (challenge.challenger == address(0)) {
             revert ChallengeDoesNotExist();
         }
 
-        // Verify the commitment was signed by the commitment key from the Delegation
+        // Verify the commitment was signed by the Delegation.committer
         address committer =
             ECDSA.recover(keccak256(abi.encode(signedCommitment.commitment)), signedCommitment.signature);
         if (committer != delegation.committer) revert UnexpectedSigner();
@@ -203,7 +209,7 @@ contract Slasher is ISlasher {
         // Decode the opaque commitment payload
         InclusionPayload memory payload = abi.decode(signedCommitment.commitment.payload, (InclusionPayload));
 
-        // Decode the signed transaction
+        // Decode the signed transaction from the payload
         TransactionDecoder.Transaction memory decodedTx = payload.signedTx.decodeEnveloped();
         TransactionData memory txData = TransactionData({
             sender: decodedTx.recoverSender(),
@@ -212,15 +218,9 @@ contract Slasher is ISlasher {
             gasLimit: decodedTx.gasLimit
         });
 
-        // Verify the comitted slot matches the proof's inclusion block number
-        // todo
-        // if (payload.slot != proof.inclusionBlockNumber) {
-        // revert WrongSlotNumberProof();
-        // }
-
         // If the inclusion proof is valid (doesn't revert) it means the the tx was included
         // This means the challenge was fraudulent and their bond is forfeited
-        _verifyInclusionProof(txData, proof);
+        _resolveWithProof(txData, proof, payload.slot);
 
         // Delete the challenge
         delete _challenges[challengeID];
@@ -264,13 +264,6 @@ contract Slasher is ISlasher {
     // =================================================== Setters ===================================================
     // todo
     // ================================================== Internal ===================================================
-    function _computeChallengeID(ISlasher.Commitment calldata commitment, ISlasher.Delegation calldata delegation)
-        internal
-        pure
-        returns (bytes32)
-    {
-        return keccak256(abi.encode(commitment, delegation));
-    }
 
     /// @notice Verify the inclusion proof for a given transaction data and inclusion / account proof
     /// @dev Will pass if it's proven the account could not afford the transaction gasLimit or nonce was too high
@@ -278,23 +271,26 @@ contract Slasher is ISlasher {
     /// @dev Will revert if the transaction doesn't exist according to the proof
     /// @param txData The transaction data
     /// @param proof The inclusion proof
-    function _verifyInclusionProof(TransactionData memory txData, InclusionProof memory proof) internal view {
+    /// @param targetSlot The target slot of the block
+    function _resolveWithProof(TransactionData memory txData, InclusionProof memory proof, uint256 targetSlot)
+        internal
+        view
+    {
         Config memory config = _config;
 
-        // The visibility of the BLOCKHASH opcode is limited to the 256 most recent blocks.
-        // Check that the previous block is within the EVM lookback window for block hashes.
-        // Clearly, if the previous block is available, the target block will be too.
-        uint256 previousBlockNumber = proof.inclusionBlockNumber - 1;
-        if (previousBlockNumber > block.number || previousBlockNumber < block.number - config.blockhashLookback) {
-            revert ProofIsTooOld();
+        // If the parent blockhash is available, the inclusion blockhash will be too
+        uint256 parentBlockNumber = proof.inclusionBlockNumber - 1;
+        if (parentBlockNumber > block.number || parentBlockNumber < block.number - config.blockhashLookback) {
+            revert BlockIsTooOld();
         }
 
-        // Get the trusted block hash for the block number in which the transactions were included.
-        bytes32 trustedPreviousBlockHash = blockhash(proof.inclusionBlockNumber - 1);
+        // Verify the proof's previous block header is canonical
+        if (blockhash(parentBlockNumber) != keccak256(proof.parentBlockHeaderRLP)) {
+            revert InvalidParentBlockHash();
+        }
 
-        // Check the integrity of the trusted block hash
-        bytes32 previousBlockHash = keccak256(proof.previousBlockHeaderRLP);
-        if (previousBlockHash != trustedPreviousBlockHash) {
+        // Verify the proof's inclusion block header is canonical
+        if (blockhash(proof.inclusionBlockNumber) != keccak256(proof.inclusionBlockHeaderRLP)) {
             revert InvalidBlockHash();
         }
 
@@ -302,7 +298,7 @@ contract Slasher is ISlasher {
         //
         // The previous block's state root is necessary to verify the account had the correct balance and
         // nonce at the top of the inclusion block (before any transactions were applied).
-        BlockHeaderData memory previousBlockHeader = _decodeBlockHeaderRLP(proof.previousBlockHeaderRLP);
+        BlockHeaderData memory parentBlockHeader = _decodeBlockHeaderRLP(proof.parentBlockHeaderRLP);
 
         // Decode the RLP-encoded block header of the inclusion block.
         //
@@ -311,34 +307,35 @@ contract Slasher is ISlasher {
         // is the correct block trusting a single block hash.
         BlockHeaderData memory inclusionBlockHeader = _decodeBlockHeaderRLP(proof.inclusionBlockHeaderRLP);
 
-        // Check that the inclusion block is a child of the previous block
-        if (inclusionBlockHeader.parentHash != previousBlockHash) {
+        // Sanity check to verify that the inclusion block is a child of the previous block
+        if (inclusionBlockHeader.parentHash != keccak256(proof.parentBlockHeaderRLP)) {
             revert InvalidParentBlockHash();
+        }
+
+        // Verify that the inclusion block is in the target slot
+        if (_getSlotFromTimestamp(inclusionBlockHeader.timestamp) != targetSlot) {
+            revert WrongSlotNumberProof();
         }
 
         // Decode the account fields by checking the account proof against the state root of the previous block header.
         // The key in the account trie is the account pubkey (address) that sent the committed transactions.
-        (bool accountExists, bytes memory accountRLP) = SecureMerkleTrie.get(
-            abi.encodePacked(txData.sender), proof.accountMerkleProof, previousBlockHeader.stateRoot
-        );
-
-        if (!accountExists) {
-            revert AccountDoesNotExist();
-        }
+        (bool accountExists, bytes memory accountRLP) =
+            SecureMerkleTrie.get(abi.encodePacked(txData.sender), proof.accountMerkleProof, parentBlockHeader.stateRoot);
+        if (!accountExists) revert AccountDoesNotExist();
 
         // Extract the nonce and balance of the account from the RLP-encoded data
         AccountData memory account = _decodeAccountRLP(accountRLP);
 
+        // The tx sender (aka "txData.sender") has sent a transaction with a higher nonce
+        // than the committed transaction, before the proposer could include it. Consider the challenge
+        // defended, as the preconfer is not at fault.
         if (account.nonce > txData.nonce) {
-            // The tx sender (aka "txData.sender") has sent a transaction with a higher nonce
-            // than the committed transaction, before the proposer could include it. Consider the challenge
-            // defended, as the preconfer is not at fault.
             return;
         }
 
+        // The tx sender account doesn't have enough balance to pay for the worst-case baseFee of the committed
+        // transaction. Consider the challenge defended, as the proposer is not at fault.
         if (account.balance < inclusionBlockHeader.baseFee * txData.gasLimit) {
-            // The tx sender account doesn't have enough balance to pay for the worst-case baseFee of the committed
-            // transaction. Consider the challenge defended, as the proposer is not at fault.
             return;
         }
 
@@ -360,6 +357,14 @@ contract Slasher is ISlasher {
         if (txData.txHash != keccak256(txRLP)) {
             revert WrongTransactionHashProof();
         }
+    }
+
+    function _computeChallengeID(ISlasher.Commitment calldata commitment, ISlasher.Delegation calldata delegation)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(commitment, delegation));
     }
 
     /// @notice Helper to convert a u64 to a little-endian bytes
@@ -410,40 +415,9 @@ contract Slasher is ISlasher {
         return _config.eth2GenesisTimestamp + _slot * _config.slotSeconds;
     }
 
-    /// @notice Get the beacon block root for a given slot
-    /// @param _slot The slot number
-    /// @return The beacon block root
-    function _getBeaconBlockRootAtSlot(uint256 _slot) internal view returns (bytes32) {
-        return _getBeaconBlockRootAtTimestamp(_getTimestampFromSlot(_slot));
-    }
-
-    function _getBeaconBlockRootAtTimestamp(uint256 _timestamp) internal view returns (bytes32) {
-        (bool success, bytes memory data) = _config.beaconBlockRootsContract.staticcall(abi.encode(_timestamp));
-
-        if (!success || data.length == 0) {
-            revert BeaconRootNotFound();
-        }
-
-        return abi.decode(data, (bytes32));
-    }
-
-    /// @notice Get the latest beacon block root
-    /// @return The beacon block root
-    function _getLatestBeaconBlockRoot() internal view returns (bytes32) {
-        uint256 latestSlot = _getSlotFromTimestamp(block.timestamp);
-        return _getBeaconBlockRootAtSlot(latestSlot);
-    }
-
     /// @notice Get the current slot
     /// @return The current slot
     function _getCurrentSlot() public view returns (uint256) {
         return _getSlotFromTimestamp(block.timestamp);
-    }
-
-    /// @notice Check if a timestamp is within the EIP-4788 window
-    /// @param _timestamp The timestamp
-    /// @return True if the timestamp is within the EIP-4788 window, false otherwise
-    function _isWithinEIP4788Window(uint256 _timestamp) internal view returns (bool) {
-        return _getSlotFromTimestamp(_timestamp) <= _getCurrentSlot() + _config.eip4788Lookback;
     }
 }
