@@ -20,6 +20,7 @@ contract Slasher is ISlasher {
     struct Config {
         address urc;
         uint256 slashAmountWei;
+        uint256 gatewayCollateralWei;
         uint256 challengeBondWei;
         uint256 challengeWindowSeconds;
         uint256 commitmentType;
@@ -80,6 +81,11 @@ contract Slasher is ISlasher {
         uint256 challengeTimestamp;
     }
 
+    enum FaultAttribution {
+        Proposer,
+        Gateway
+    }
+
     /**
      *
      *                                        E V E N T S   &   E R R O R S                                         *
@@ -104,6 +110,10 @@ contract Slasher is ISlasher {
     error AccountNonceTooHigh();
     error AccountBalanceTooLow();
     error WrongSlotNumberProof();
+    error InvalidEvidence();
+    error FraudProofWindowActive();
+    error NotURC();
+    error InvalidCollateralAmount();
 
     /**
      *
@@ -118,12 +128,18 @@ contract Slasher is ISlasher {
     // Mapping of approved relays
     mapping(address _relay => bool _approved) internal _approvedRelays;
 
+    // Mapping of gateway collateral
+    mapping(address _gateway => uint256 _collateral) internal _gatewayCollateral;
+
     /**
      *
      *                                              M O D I F I E R S                                               *
      *
      */
-    //todo
+    modifier onlyApprovedRelays(address _sender) {
+        if (!_approvedRelays[_sender]) revert OnlyApprovedRelays();
+        _;
+    }
 
     /**
      *
@@ -140,6 +156,7 @@ contract Slasher is ISlasher {
 
     /// @notice Create a challenge for a given commitment and delegation
     /// @dev The challenge is created by locking a challenge bond amount of `_config.challengeBondWei`
+    /// @dev Signature checks aren't performed here since they are performed in the URC
     /// @param commitment The commitment
     /// @param delegation The delegation
     /// @return challengeID The challenge ID
@@ -232,16 +249,59 @@ contract Slasher is ISlasher {
         }
     }
 
+    /// @dev Slashes the proposer or gateway via the URC after the fraud proof window has expired
+    /// @dev It's required that a registered Relay initiates this function from the URC. They will be the `challenger` argument
+    /// @dev The URC will have pre-verified the Delegation and Commitment signatures
+    /// @dev The evidence should be an abi-encoded FaultAttribution
+    /// @param delegation The proposer's delegation
+    /// @param commitment The proposer's commitment
+    /// @param committer The gateway's committer address
+    /// @param evidence Arbitrary evidence for the slashing
+    /// @param challenger The msg.sender that originated URC.slashCommitment()
+    /// @return _slashAmountWei The amount of WEI slashed
     function slash(
         Delegation calldata delegation,
         Commitment calldata commitment,
         address committer,
         bytes calldata evidence,
         address challenger
-    ) external returns (uint256 _slashAmountWei) {
-        if (!_approvedRelays[challenger]) revert OnlyApprovedRelays();
+    ) external onlyApprovedRelays(challenger) returns (uint256 _slashAmountWei) {
+        Config memory config = _config;
 
-        _slashAmountWei = _config.slashAmountWei;
+        // Only the URC can initiate this
+        if (msg.sender != config.urc) revert NotURC();
+
+        // Recover the challenge
+        bytes32 challengeID = _computeChallengeID(commitment, delegation);
+        Challenge memory challenge = _challenges[challengeID];
+
+        // Verify the fraud proof window has expired
+        if (challenge.challengeTimestamp + config.challengeWindowSeconds > block.timestamp) {
+            revert FraudProofWindowActive();
+        }
+
+        // Delete the challenge
+        delete _challenges[challengeID];
+
+        // Return the challenge bond to the original challenger
+        (bool success,) = challenge.challenger.call{value: config.challengeBondWei}("");
+        if (!success) revert EthTransferFailed();
+
+        // Verify the evidence is an abi-encoded FaultAttribution
+        FaultAttribution faultAttribution = abi.decode(evidence, (FaultAttribution));
+
+        // Slash the proposer or gateway based on the evidence
+        if (faultAttribution == FaultAttribution.Proposer) {
+            // Slash the proposer by returning the full slash amount
+            _slashAmountWei = config.slashAmountWei;
+        } else if (faultAttribution == FaultAttribution.Gateway) {
+            // Slash the gateway by burning their collateral
+            _gatewayCollateral[committer] -= config.gatewayCollateralWei;
+            _burnETH(config.gatewayCollateralWei);
+
+            // Return the minimum slash amount
+            _slashAmountWei = 1 wei;
+        }
     }
 
     // =================================================== Getters ===================================================
@@ -262,7 +322,17 @@ contract Slasher is ISlasher {
     }
 
     // =================================================== Setters ===================================================
-    // todo
+    function addCollateral() external payable {
+        if (msg.value < _config.gatewayCollateralWei) revert InvalidCollateralAmount();
+        _gatewayCollateral[msg.sender] += msg.value;
+    }
+
+    function returnCollateral(address gateway) external onlyApprovedRelays(msg.sender) {
+        uint256 collateral = _gatewayCollateral[gateway];
+        _gatewayCollateral[gateway] = 0;
+        (bool success,) = gateway.call{value: collateral}("");
+        if (!success) revert EthTransferFailed();
+    }
     // ================================================== Internal ===================================================
 
     /// @notice Verify the inclusion proof for a given transaction data and inclusion / account proof
@@ -419,5 +489,18 @@ contract Slasher is ISlasher {
     /// @return The current slot
     function _getCurrentSlot() public view returns (uint256) {
         return _getSlotFromTimestamp(block.timestamp);
+    }
+
+    /// @notice Burns ether
+    /// @dev The function will revert if the transfer to the BURNER_ADDRESS fails.
+    /// @param amountWei The amount of WEI to be burned
+    function _burnETH(uint256 amountWei) internal {
+        // Burn the slash amount
+        bool success;
+        address burner = address(0x0000000000000000000000000000000000000000);
+        assembly ("memory-safe") {
+            success := call(gas(), burner, amountWei, 0, 0, 0, 0)
+        }
+        if (!success) revert EthTransferFailed();
     }
 }
