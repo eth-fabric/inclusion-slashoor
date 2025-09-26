@@ -20,18 +20,14 @@ The Relay must receive and store `SignedConstraints` messages from Gateways. The
 #### Receiving block with proofs
 Upon receieving a block, the Relay must verify the Merkle inclusion proofs satisfy all inclusion preconf constraints that are part of the `SignedConstraints` message. If and only if they are all valid will the Relay make the block accessible to the Proposer via the standard `GET /header` endpoint.
 
-
-
 ### Gateway
 #### Receiving `CommitmentRequest`
 The Gateway [must ingest `CommitmentRequest` messages](https://github.com/eth-fabric/constraints-specs/blob/signature-docs/specs/gateway.md#receiving-commitment-requests) for inclusion preconfs, where the `CommitmentRequest.payload` is the abi-encoded `InclusionPayload`.
 
 ```python
 class InclusionPayload(Container):
-    tx_hash: Bytes32
-    nonce: uint256
-    gas_limit: uint256
     slot: uint64
+    signed_tx: Bytes
 ```
 
 They will respond with a `SignedCommitment`, where the `SignedCommitment.commitment.payload` is the abi-encoded `InclusionPayload`, the `SignedCommitment.commitment.request_hash` is the keccak256 of the abi-encoded `CommitmentRequest`, and the `SignedCommitment.commitment.slasher` is the address of the Slasher contract defined in this repo.
