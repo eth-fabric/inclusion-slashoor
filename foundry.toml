@@ -3,4 +3,13 @@ src = "src"
 out = "out"
 libs = ["lib"]
 
+fs_permissions = [{ access = "read", path = "./test/testdata" }]
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+
+evm_version = "prague" # for testing bls precompiles
+
+[rpc_endpoints]
+mainnet = "${ETH_RPC_URL}"
+holesky = "${ETH_RPC_URL_HOLESKY}"
+hoody = "${ETH_RPC_URL_HOODY}"

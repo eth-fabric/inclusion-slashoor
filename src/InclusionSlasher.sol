@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity >=0.8.0 <0.9.0;
 
+// Adapted from https://github.com/chainbound/bolt/tree/unstable/bolt-contracts
+
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 import {ISlasher} from "urc/src/ISlasher.sol";
@@ -11,7 +13,7 @@ import {RLPReader} from "urc/example/lib/rlp/RLPReader.sol";
 import {RLPWriter} from "urc/example/lib/rlp/RLPWriter.sol";
 import {TransactionDecoder} from "urc/example/lib/TransactionDecoder.sol";
 
-contract Slasher is ISlasher {
+contract InclusionSlasher is ISlasher {
     using RLPReader for bytes;
     using RLPReader for RLPReader.RLPItem;
     using TransactionDecoder for bytes;
@@ -98,7 +100,7 @@ contract Slasher is ISlasher {
     error BeaconRootNotFound();
     error ChallengeAlreadyExists();
     error ChallengeDoesNotExist();
-    error DelegationExpired();
+    error MismatchedSlot();
     error EthTransferFailed();
     error BlockIsTooOld();
     error InvalidParentBlockHash();
@@ -185,7 +187,7 @@ contract Slasher is ISlasher {
 
         // Check if the delegation applies to the slot of the commitment
         if (delegation.slot != payload.slot) {
-            revert DelegationExpired();
+            revert MismatchedSlot();
         }
 
         // Compute the challenge ID

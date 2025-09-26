@@ -4,3 +4,4 @@
 [submodule "lib/urc"]
 	path = lib/urc
 	url = https://github.com/eth-fabric/urc
+	branch = signing-domain
