@@ -323,6 +323,10 @@ contract InclusionSlasher is ISlasher {
         return _challenges[_computeChallengeID(commitment, delegation)];
     }
 
+    function getGatewayCollateral(address gateway) external view returns (uint256) {
+        return _gatewayCollateral[gateway];
+    }
+
     // =================================================== Setters ===================================================
     function addCollateral() external payable {
         if (msg.value < _config.gatewayCollateralWei) revert InvalidCollateralAmount();

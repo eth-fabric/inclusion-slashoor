@@ -54,11 +54,9 @@ contract InclusionSlasherTest is UnitTestHelper {
 
     // Test params: https://etherscan.io/block/20785012
     uint256 constant inclusionBlockNumber = 20_785_012;
-    uint64 constant inclusionSlot = 9_994_144;
+    uint64 constant inclusionSlot = 9_994_114;
 
     function setUp() public {
-        // vm.createSelectFork(vm.rpcUrl("mainnet")); //todo
-
         registryConfig = defaultConfig();
         registry = new Registry(registryConfig);
 
@@ -257,7 +255,7 @@ contract InclusionSlasherTest is UnitTestHelper {
         );
     }
 
-    function test_slash() public {
+    function test_slash_proposer() public {
         // Register at URC and generate slashable evidence
         (
             RegisterAndDelegateResult memory result,
@@ -267,7 +265,7 @@ contract InclusionSlasherTest is UnitTestHelper {
 
         // Save initial balances for comparison
         uint256 challengerBalanceBefore = challenger.balance;
-        uint256 operatorBalanceBefore = operator.balance;
+        uint256 proposerBalanceBefore = proposer.balance;
         uint256 urcBalanceBefore = address(registry).balance;
 
         // Advance to first finalized slot after the target slot
@@ -291,6 +289,7 @@ contract InclusionSlasherTest is UnitTestHelper {
         IRegistry.RegistrationProof memory proof =
             registry.getRegistrationProof(result.registrations, proposer, 0, signingId);
 
+        // Evidence for slashing the proposer
         bytes memory evidence = abi.encode(InclusionSlasher.FaultAttribution.Proposer);
 
         // Slash via URC
@@ -319,93 +318,150 @@ contract InclusionSlasherTest is UnitTestHelper {
         assertEq(registry.slashingEvidenceAlreadyUsed(slashingDigest), true, "slashedBefore not set");
     }
 
-    // function test_revert_slash_wrongChallenger() public {
-    //     (
-    //         RegisterAndDelegateResult memory result,
-    //         ISlasher.SignedCommitment memory signedCommitment,
-    //         PreconfStructs.InclusionProof memory inclusionProof
-    //     ) = setupSlash(1);
+    function test_slash_gateway() public {
+        // Register at URC and generate slashable evidence
+        (
+            RegisterAndDelegateResult memory result,
+            ISlasher.SignedCommitment memory signedCommitment,
+            InclusionSlasher.InclusionProof memory inclusionProof
+        ) = setupSlash();
 
-    //     // Create challenge as the original challenger
-    //     vm.prank(challenger);
-    //     bytes32 challengeID =
-    //         slasher.createChallenge{ value: slasher.CHALLENGE_BOND() }(signedCommitment, result.signedDelegation);
+        // Add collateral to the gateway
+        vm.prank(gateway);
+        slasher.addCollateral{value: config.gatewayCollateralWei}();
 
-    //     // Skip ahead past the challenge window
-    //     vm.warp(block.timestamp + slasher.CHALLENGE_WINDOW() + 1);
+        // Save initial balances for comparison
+        uint256 gatewayBalanceBefore = slasher.getGatewayCollateral(gateway);
 
-    //     // Merkle proof for URC registration
-    //     IRegistry.RegistrationProof memory proof =
-    //         registry.getRegistrationProof(result.registrations, operator, 0, signingId);
+        // Advance to first finalized slot after the target slot
+        uint256 targetTimestamp = slasher._getTimestampFromSlot(inclusionSlot);
+        uint256 time = targetTimestamp + config.finalizationSlots * config.slotTime;
+        vm.warp(time);
 
-    //     // Try to slash as different address (not the original challenger)
-    //     vm.prank(operator);
-    //     vm.expectRevert(PreconfStructs.WrongChallengerAddress.selector);
-    //     registry.slashCommitment(proof, result.signedDelegation, signedCommitment, abi.encode(inclusionProof));
-    // }
+        // Create challenge
+        vm.prank(challenger);
+        bytes32 challengeID = slasher.createChallenge{value: config.challengeBondWei}(
+            signedCommitment.commitment, result.signedDelegation.delegation
+        );
 
-    // function test_revert_slash_notURC() public {
-    //     (
-    //         RegisterAndDelegateResult memory result,
-    //         ISlasher.SignedCommitment memory signedCommitment,
-    //         PreconfStructs.InclusionProof memory inclusionProof
-    //     ) = setupSlash(1);
+        // Skip ahead past the challenge window
+        vm.warp(time + config.challengeWindowSeconds + 1);
 
-    //     // Try to call slash directly (not through URC)
-    //     vm.expectRevert(PreconfStructs.NotURC.selector);
-    //     slasher.slash(
-    //         result.signedDelegation.delegation,
-    //         signedCommitment.commitment,
-    //         committer,
-    //         abi.encode(inclusionProof),
-    //         address(0)
-    //     );
-    // }
+        // Merkle proof for URC registration
+        IRegistry.RegistrationProof memory proof =
+            registry.getRegistrationProof(result.registrations, proposer, 0, signingId);
 
-    // function test_proveChallengeFraudulent() public {
-    //     // Register at URC and generate slashable evidence
-    //     (
-    //         RegisterAndDelegateResult memory result,
-    //         ISlasher.SignedCommitment memory signedCommitment,
-    //         PreconfStructs.InclusionProof memory inclusionProof
-    //     ) = setupSlash(1);
+        // Evidence for slashing the gateway
+        bytes memory evidence = abi.encode(InclusionSlasher.FaultAttribution.Gateway);
 
-    //     // Save initial balances for comparison
-    //     uint256 challengerBalanceBefore = challenger.balance;
-    //     uint256 operatorBalanceBefore = operator.balance;
-    //     uint256 bond = slasher.CHALLENGE_BOND();
+        // Slash via URC
+        vm.prank(relay);
+        registry.slashCommitment(proof, result.signedDelegation, signedCommitment, evidence);
 
-    //     // Create challenge
-    //     vm.prank(challenger);
-    //     bytes32 challengeID = slasher.createChallenge{ value: bond }(signedCommitment, result.signedDelegation);
+        // Verify gateway's collateralGwei is decremented
+        assertEq(slasher.getGatewayCollateral(gateway), 0, "gateway collateral not decremented");
+    }
 
-    //     // Verify challenger's balance decreased by bond amount
-    //     assertEq(challenger.balance, challengerBalanceBefore - bond);
+    function test_revert_slash_onlyApprovedRelays() public {
+        (
+            RegisterAndDelegateResult memory result,
+            ISlasher.SignedCommitment memory signedCommitment,
+            InclusionSlasher.InclusionProof memory inclusionProof
+        ) = setupSlash();
 
-    //     // Prove the challenge is fraudulent (transaction was actually included)
-    //     vm.prank(operator);
-    //     slasher.proveChallengeFraudulent(result.signedDelegation.delegation, signedCommitment, inclusionProof);
+        // Start at target slot number plus finalization slots
+        uint256 targetTimestamp = slasher._getTimestampFromSlot(result.signedDelegation.delegation.slot);
+        uint256 time = targetTimestamp + config.finalizationSlots * config.slotTime;
+        vm.warp(time);
 
-    //     // Verify challenger lost their bond (transferred to operator)
-    //     assertEq(operator.balance, operatorBalanceBefore + bond);
-    //     assertEq(challenger.balance, challengerBalanceBefore - bond);
+        vm.prank(challenger);
+        bytes32 challengeID = slasher.createChallenge{value: config.challengeBondWei}(
+            signedCommitment.commitment, result.signedDelegation.delegation
+        );
 
-    //     // Verify challenge was deleted
-    //     (address storedChallenger,) = slasher.challenges(challengeID);
-    //     assertEq(storedChallenger, address(0));
-    // }
+        // Skip ahead past the challenge window
+        vm.warp(time + config.challengeWindowSeconds + 1);
 
-    // function test_revert_proveChallengeFraudulent_nonexistentChallenge() public {
-    //     (
-    //         RegisterAndDelegateResult memory result,
-    //         ISlasher.SignedCommitment memory signedCommitment,
-    //         PreconfStructs.InclusionProof memory inclusionProof
-    //     ) = setupSlash(1);
+        // Merkle proof for URC registration
+        IRegistry.RegistrationProof memory proof =
+            registry.getRegistrationProof(result.registrations, proposer, 0, signingId);
 
-    //     // Try to prove fraudulent for a challenge that doesn't exist
-    //     vm.expectRevert(PreconfStructs.ChallengeDoesNotExist.selector);
-    //     slasher.proveChallengeFraudulent(result.signedDelegation.delegation, signedCommitment, inclusionProof);
-    // }
+        // Try to slash as not an approved relay
+        vm.prank(challenger);
+        vm.expectRevert(InclusionSlasher.OnlyApprovedRelays.selector);
+        registry.slashCommitment(proof, result.signedDelegation, signedCommitment, abi.encode(inclusionProof));
+    }
+
+    function test_revert_slash_notURC() public {
+        (
+            RegisterAndDelegateResult memory result,
+            ISlasher.SignedCommitment memory signedCommitment,
+            InclusionSlasher.InclusionProof memory inclusionProof
+        ) = setupSlash();
+
+        // Try to call slash directly (not through URC)
+        vm.prank(relay);
+        vm.expectRevert(InclusionSlasher.NotURC.selector);
+        slasher.slash(
+            result.signedDelegation.delegation, signedCommitment.commitment, gateway, abi.encode(inclusionProof), relay
+        );
+    }
+
+    function test_defendChallenge() public {
+        // Register at URC and generate slashable evidence
+        (
+            RegisterAndDelegateResult memory result,
+            ISlasher.SignedCommitment memory signedCommitment,
+            InclusionSlasher.InclusionProof memory inclusionProof
+        ) = setupSlash();
+
+        // Save initial balances for comparison
+        uint256 challengerBalanceBefore = challenger.balance;
+        uint256 proposerBalanceBefore = proposer.balance;
+        uint256 bond = config.challengeBondWei;
+
+        // Advance to first finalized slot after the target slot
+        uint256 targetTimestamp = slasher._getTimestampFromSlot(inclusionSlot);
+        uint256 time = targetTimestamp + config.finalizationSlots * config.slotTime;
+        vm.warp(time);
+        vm.roll(inclusionBlockNumber + config.finalizationSlots);
+
+        // Create challenge
+        vm.prank(challenger);
+        bytes32 challengeID =
+            slasher.createChallenge{value: bond}(signedCommitment.commitment, result.signedDelegation.delegation);
+
+        // Verify challenger's balance decreased by bond amount
+        assertEq(challenger.balance, challengerBalanceBefore - bond);
+
+        // To save on RPC calls, we pre-fill the blockhashes with the expected values
+        vm.setBlockhash(inclusionProof.inclusionBlockNumber - 1, keccak256(inclusionProof.parentBlockHeaderRLP));
+        vm.setBlockhash(inclusionProof.inclusionBlockNumber, keccak256(inclusionProof.inclusionBlockHeaderRLP));
+
+        // Prove the challenge is fraudulent (transaction was actually included)
+        vm.prank(proposer);
+        slasher.defendChallenge(result.signedDelegation.delegation, signedCommitment, inclusionProof);
+
+        // Verify challenger lost their bond (transferred to proposer)
+        assertEq(proposer.balance, proposerBalanceBefore + bond);
+        assertEq(challenger.balance, challengerBalanceBefore - bond);
+
+        // Verify challenge was deleted
+        InclusionSlasher.Challenge memory challenge = slasher.getChallenge(challengeID);
+        assertEq(challenge.challenger, address(0));
+    }
+
+    function test_revert_defendChallenge_nonexistentChallenge() public {
+        (
+            RegisterAndDelegateResult memory result,
+            ISlasher.SignedCommitment memory signedCommitment,
+            InclusionSlasher.InclusionProof memory inclusionProof
+        ) = setupSlash();
+
+        // Try to prove fraudulent for a challenge that doesn't exist
+        vm.expectRevert(InclusionSlasher.ChallengeDoesNotExist.selector);
+        slasher.defendChallenge(result.signedDelegation.delegation, signedCommitment, inclusionProof);
+    }
 
     // =========== Helper functions ===========
 
