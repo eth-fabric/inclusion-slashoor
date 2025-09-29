@@ -47,7 +47,7 @@ contract InclusionSlasherTest is UnitTestHelper {
 
     // Signing params
     bytes32 signingId = keccak256("test-signing-id");
-    bytes32 nonce = keccak256("nonce");
+    uint64 nonce = uint64(1337);
 
     // Relay for slashing
     address relay = makeAddr("relay");
