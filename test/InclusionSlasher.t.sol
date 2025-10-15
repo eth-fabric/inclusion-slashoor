@@ -71,7 +71,9 @@ contract InclusionSlasherTest is UnitTestHelper {
             slotSeconds: 12,
             finalizationSlots: 64,
             blockhashLookback: 256,
-            slotTime: 12
+            slotTime: 12,
+            signingDomain: registryConfig.signingDomain,
+            chainId: registryConfig.chainId
         });
 
         address[] memory relays = new address[](1);
@@ -135,7 +137,15 @@ contract InclusionSlasherTest is UnitTestHelper {
         // Gateway signs a commitment to include a TX
         InclusionSlasher.InclusionPayload memory payload =
             _createInclusionCommitment(inclusionBlockNumber, inclusionSlot);
-        signedCommitment = basicCommitment(gatewayECDSASecretKey, address(slasher), abi.encode(payload));
+        signedCommitment = basicCommitment(
+            gatewayECDSASecretKey,
+            address(slasher),
+            abi.encode(payload),
+            signingId,
+            nonce,
+            registryConfig.chainId,
+            registryConfig.signingDomain
+        );
 
         // Build the inclusion and account proofs
         string memory encodedParentHeader = vm.readFile("./test/testdata/header_20785011.json");
@@ -170,9 +180,9 @@ contract InclusionSlasherTest is UnitTestHelper {
         vm.warp(targetTimestamp + config.finalizationSlots * config.slotTime);
 
         vm.prank(challenger);
-        bytes32 challengeID = slasher.createChallenge{value: config.challengeBondWei}(
-            signedCommitment.commitment, result.signedDelegation.delegation
-        );
+        bytes32 challengeID = slasher.createChallenge{
+            value: config.challengeBondWei
+        }(signedCommitment.commitment, result.signedDelegation.delegation);
         assertEq(challengeID, keccak256(abi.encode(signedCommitment.commitment, result.signedDelegation.delegation)));
     }
 
@@ -201,16 +211,16 @@ contract InclusionSlasherTest is UnitTestHelper {
         vm.warp(targetTimestamp + config.finalizationSlots * config.slotTime);
 
         vm.prank(challenger);
-        bytes32 challengeID = slasher.createChallenge{value: config.challengeBondWei}(
-            signedCommitment.commitment, result.signedDelegation.delegation
-        );
+        bytes32 challengeID = slasher.createChallenge{
+            value: config.challengeBondWei
+        }(signedCommitment.commitment, result.signedDelegation.delegation);
 
         // Try to create duplicate challenge
         vm.expectRevert(InclusionSlasher.ChallengeAlreadyExists.selector);
         vm.prank(challenger);
-        slasher.createChallenge{value: config.challengeBondWei}(
-            signedCommitment.commitment, result.signedDelegation.delegation
-        );
+        slasher.createChallenge{
+            value: config.challengeBondWei
+        }(signedCommitment.commitment, result.signedDelegation.delegation);
     }
 
     function test_revert_challenge_mismatchedSlot() public {
@@ -240,8 +250,15 @@ contract InclusionSlasherTest is UnitTestHelper {
         InclusionSlasher.InclusionPayload memory payload =
             _createInclusionCommitment(inclusionBlockNumber, inclusionSlot);
 
-        ISlasher.SignedCommitment memory signedCommitment =
-            basicCommitment(gatewayECDSASecretKey, address(slasher), abi.encode(payload));
+        ISlasher.SignedCommitment memory signedCommitment = basicCommitment(
+            gatewayECDSASecretKey,
+            address(slasher),
+            abi.encode(payload),
+            signingId,
+            nonce,
+            registryConfig.chainId,
+            registryConfig.signingDomain
+        );
 
         // Advance to first finalized slot after the target slot
         uint256 targetTimestamp = slasher._getTimestampFromSlot(inclusionSlot);
@@ -250,9 +267,9 @@ contract InclusionSlasherTest is UnitTestHelper {
         // Try to create challenge with mismatched slot
         vm.prank(challenger);
         vm.expectRevert(InclusionSlasher.MismatchedSlot.selector);
-        slasher.createChallenge{value: config.challengeBondWei}(
-            signedCommitment.commitment, result.signedDelegation.delegation
-        );
+        slasher.createChallenge{
+            value: config.challengeBondWei
+        }(signedCommitment.commitment, result.signedDelegation.delegation);
     }
 
     function test_slash_proposer() public {
@@ -275,9 +292,9 @@ contract InclusionSlasherTest is UnitTestHelper {
 
         // Create challenge
         vm.prank(challenger);
-        bytes32 challengeID = slasher.createChallenge{value: config.challengeBondWei}(
-            signedCommitment.commitment, result.signedDelegation.delegation
-        );
+        bytes32 challengeID = slasher.createChallenge{
+            value: config.challengeBondWei
+        }(signedCommitment.commitment, result.signedDelegation.delegation);
 
         // Verify challenger's balance decreased by bond amount
         assertEq(challenger.balance, challengerBalanceBefore - config.challengeBondWei);
@@ -340,9 +357,9 @@ contract InclusionSlasherTest is UnitTestHelper {
 
         // Create challenge
         vm.prank(challenger);
-        bytes32 challengeID = slasher.createChallenge{value: config.challengeBondWei}(
-            signedCommitment.commitment, result.signedDelegation.delegation
-        );
+        bytes32 challengeID = slasher.createChallenge{
+            value: config.challengeBondWei
+        }(signedCommitment.commitment, result.signedDelegation.delegation);
 
         // Skip ahead past the challenge window
         vm.warp(time + config.challengeWindowSeconds + 1);
@@ -375,9 +392,9 @@ contract InclusionSlasherTest is UnitTestHelper {
         vm.warp(time);
 
         vm.prank(challenger);
-        bytes32 challengeID = slasher.createChallenge{value: config.challengeBondWei}(
-            signedCommitment.commitment, result.signedDelegation.delegation
-        );
+        bytes32 challengeID = slasher.createChallenge{
+            value: config.challengeBondWei
+        }(signedCommitment.commitment, result.signedDelegation.delegation);
 
         // Skip ahead past the challenge window
         vm.warp(time + config.challengeWindowSeconds + 1);

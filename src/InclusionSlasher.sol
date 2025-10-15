@@ -3,10 +3,9 @@ pragma solidity >=0.8.0 <0.9.0;
 
 // Adapted from https://github.com/chainbound/bolt/tree/unstable/bolt-contracts
 
-import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-
 import {ISlasher} from "urc/src/ISlasher.sol";
 import {IRegistry} from "urc/src/IRegistry.sol";
+import {ECDSAUtils} from "urc/src/lib/ECDSAUtils.sol";
 import {MerkleTrie} from "urc/example/lib/trie/MerkleTrie.sol";
 import {SecureMerkleTrie} from "urc/example/lib/trie/SecureMerkleTrie.sol";
 import {RLPReader} from "urc/example/lib/rlp/RLPReader.sol";
@@ -32,6 +31,9 @@ contract InclusionSlasher is ISlasher {
         uint256 finalizationSlots;
         uint256 blockhashLookback;
         uint256 slotTime;
+        // Signing parameters for URC compatibility
+        bytes32 signingDomain;
+        bytes32 chainId;
     }
 
     struct BlockHeaderData {
@@ -221,8 +223,14 @@ contract InclusionSlasher is ISlasher {
         }
 
         // Verify the commitment was signed by the Delegation.committer
-        address committer =
-            ECDSA.recover(keccak256(abi.encode(signedCommitment.commitment)), signedCommitment.signature);
+        address committer = ECDSAUtils.recover(
+            keccak256(abi.encode(IRegistry.MessageType.Commitment, signedCommitment.commitment)),
+            signedCommitment.signature,
+            _config.signingDomain,
+            signedCommitment.signingId,
+            signedCommitment.nonce,
+            _config.chainId
+        );
         if (committer != delegation.committer) revert UnexpectedSigner();
 
         // Decode the opaque commitment payload
@@ -339,6 +347,7 @@ contract InclusionSlasher is ISlasher {
         (bool success,) = gateway.call{value: collateral}("");
         if (!success) revert EthTransferFailed();
     }
+
     // ================================================== Internal ===================================================
 
     /// @notice Verify the inclusion proof for a given transaction data and inclusion / account proof
